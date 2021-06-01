@@ -10,7 +10,13 @@ from opentracing.ext import tags as ot_tags
 from opentracing_utils.span import get_parent_span
 
 
-def trace_sqlalchemy(operation_name=None, span_extractor=None, set_error_tag=False, skip_span=None):
+def trace_sqlalchemy(
+    operation_name=None,
+    span_extractor=None,
+    set_error_tag=False,
+    skip_span=None,
+    use_scope_manager=False
+):
     """
     Trace Sqlalchemy database queries.
 
@@ -28,6 +34,9 @@ def trace_sqlalchemy(operation_name=None, span_extractor=None, set_error_tag=Fal
     :param skip_span: Callable to determine whether to skip this SQL query(ies) spans. If returned ``True`` then span
                       will be skipped.
     :type skip_span: Callable[conn, cursor, statement, parameters, context, executemany]
+
+    :param use_scope_manager: Always use the scope manager when starting the span.
+    :type use_scope_manager: bool
     """
 
     @listens_for(Engine, 'before_cursor_execute')
@@ -35,9 +44,17 @@ def trace_sqlalchemy(operation_name=None, span_extractor=None, set_error_tag=Fal
         if callable(skip_span) and skip_span(conn, cursor, statement, parameters, context, executemany):
             return
 
-        if callable(span_extractor):
+        parent_span = None
+        using_scope_manager = False
+        try:
+            parent_span = opentracing.tracer.active_span
+            using_scope_manager = True if parent_span else False
+        except AttributeError:
+            ...
+
+        if not parent_span and callable(span_extractor):
             parent_span = span_extractor(conn, cursor, statement, parameters, context, executemany)
-        else:
+        elif not parent_span:
             _, parent_span = get_parent_span()
 
         if context:
@@ -54,11 +71,17 @@ def trace_sqlalchemy(operation_name=None, span_extractor=None, set_error_tag=Fal
                     .set_tag('db.engine', context.dialect.name)
                     .set_tag('db.statement', statement))
 
+                if use_scope_manager or using_scope_manager:
+                    scope = opentracing.tracer.scope_manager.activate(query_span, finish_on_close=True)
+                    context._query_scope = scope
+
                 context._query_span = query_span
 
     @listens_for(Engine, 'after_cursor_execute')
     def tarce_after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-        if hasattr(context, '_query_span'):
+        if hasattr(context, '_query_scope'):
+            context._query_scope.close()
+        elif hasattr(context, '_query_span'):
             context._query_span.finish()
 
     @listens_for(Engine, 'handle_error')
@@ -70,4 +93,7 @@ def trace_sqlalchemy(operation_name=None, span_extractor=None, set_error_tag=Fal
             if set_error_tag:
                 context._query_span.set_tag('error', True)
 
+        if hasattr(context, '_query_scope'):
+            context._query_scope.close()
+        else:
             context._query_span.finish()
